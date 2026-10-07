@@ -5,6 +5,8 @@
 PCR 时间线倒退或间隔超限。
 
 - `POST /api/mpegts/audit?maxPcrGapMs=<1..10000>`
+- 可选恒定复用速率模式：追加 `expectedMuxRateBps=<100000..200000000>&maxRateErrorPpm=<1..100000>`，
+  两个参数必须同时出现；同时省略时行为与原来完全一致
 - 请求体：`Content-Type: application/octet-stream`，原始 MPEG-TS，不超过 8 MiB
 - 只接受由 188 字节包组成的单节目流；任一规则失败即整体拒绝，不返回部分结果
 
@@ -23,6 +25,11 @@ PCR 时间线倒退或间隔超限。
    递增；仅适配字段包必须保持计数不变；带载荷重复同一计数视为错误。
 7. PCR 只能出现在 PMT 指定的 PCR PID 上；按 33 位基值回绕展开后不得倒退，
    相邻 PCR 间隔不得超过 `maxPcrGapMs`。
+8. （可选，给定 `expectedMuxRateBps` 与 `maxRateErrorPpm` 时）以相邻 PCR
+   所在包的零基起始位置与展开后的 27 MHz 时钟计算每个区间的传输速率：
+   `区间字节数*8*27MHz/时钟增量`，逐区间与期望速率比较，相对误差均不得
+   超过给定百万分比。至少需要两个 PCR，时钟增量必须为正，33 位回绕正确
+   展开；参数缺失/越界、区间不可计算或超差均整体拒绝，不返回部分报告。
 
 ## 成功响应
 
@@ -50,6 +57,12 @@ PCR 时间线倒退或间隔超限。
 }
 ```
 
+启用恒定复用速率模式时，`report` 内额外携带（省略两个参数时该字段缺省）：
+
+```json
+"muxRate": { "expectedMuxRateBps": 1504000, "tolerancePpm": 1000, "intervalsChecked": 3 }
+```
+
 ## 失败响应
 
 `422 Unprocessable Entity`（请求类错误为 400/413/415/405），包含包序号、
@@ -68,7 +81,14 @@ PCR 时间线倒退或间隔超限。
 `TS_TRANSPORT_ERROR`、`TS_SCRAMBLED`、`TS_DISCONTINUITY_FLAG`、
 `TS_MULTI_PROGRAM`、`TS_SECTION_CRC`、`TS_CC_GAP`、
 `TS_CC_DUPLICATE_WITH_PAYLOAD`、`TS_PCR_ON_WRONG_PID`、
-`TS_PCR_REVERSED`、`TS_PCR_GAP_EXCEEDED` 等）。
+`TS_PCR_REVERSED`、`TS_PCR_GAP_EXCEEDED`、
+`TS_MUX_RATE_INTERVAL_UNCOMPUTABLE`、`TS_MUX_RATE_MISMATCH` 等）。
+
+速率模式失败时，错误定位到最早不合格区间的**后一个** PCR（其包序号与
+PID）：区间不可计算（不足两个 PCR 或时钟增量非正）为
+`TS_MUX_RATE_INTERVAL_UNCOMPUTABLE`，超差为 `TS_MUX_RATE_MISMATCH`。
+请求类参数错误为 400：只给一个参数时 `TS_MISSING_MUX_RATE_PARAM`，
+取值无法解析或越界时 `TS_INVALID_MUX_RATE_PARAM`。
 
 ## 本地开发（仅需 Go 1.23+）
 

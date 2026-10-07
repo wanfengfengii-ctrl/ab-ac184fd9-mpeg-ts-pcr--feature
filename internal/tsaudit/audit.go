@@ -9,6 +9,30 @@ const MaxBodyBytes = 8 << 20
 // (base ticks * 300 extension ticks).
 const pcrCycle = int64(1) << 33 * 300
 
+// MuxRate bounds for the optional constant-mux-rate check (bits per second).
+const (
+	MinMuxRateBps   = 100000
+	MaxMuxRateBps   = 200000000
+	MinRateErrorPpm = 1
+	MaxRateErrorPpm = 100000
+)
+
+// Options carries every audit parameter. MaxPcrGapMs is always required; the
+// mux-rate fields are optional and, when used, must both be set (the handler
+// enforces that). Zero values disable the constant-mux-rate check.
+type Options struct {
+	MaxPcrGapMs        int
+	ExpectedMuxRateBps int64
+	MaxRateErrorPpm    int64
+}
+
+// MuxRateReport summarises a successful constant-mux-rate check.
+type MuxRateReport struct {
+	ExpectedMuxRateBps int64 `json:"expectedMuxRateBps"`
+	TolerancePpm       int64 `json:"tolerancePpm"`
+	IntervalsChecked   int   `json:"intervalsChecked"`
+}
+
 // PCRRef locates one PCR value in the fragment.
 type PCRRef struct {
 	Packet     int   `json:"packet"`
@@ -37,6 +61,7 @@ type Report struct {
 	DurationMs    float64         `json:"durationMs"`
 	PayloadBytes  int64           `json:"payloadBytes"`
 	Media         []MediaPIDStats `json:"media"`
+	MuxRate       *MuxRateReport  `json:"muxRate,omitempty"`
 }
 
 type ccState struct {
@@ -44,11 +69,26 @@ type ccState struct {
 	cc      int
 }
 
-// Audit validates a raw MPEG-TS fragment. On success it returns a Report; on
-// the first violated rule it returns an AuditError and no partial results.
+// Audit validates a raw MPEG-TS fragment with the constant-mux-rate check
+// disabled. It is a compatibility wrapper around AuditWithOptions.
 func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
+	return AuditWithOptions(data, Options{MaxPcrGapMs: maxPcrGapMs})
+}
+
+// AuditWithOptions validates a raw MPEG-TS fragment. On success it returns a
+// Report; on the first violated rule it returns an AuditError and no partial
+// results. When both mux-rate options are set, every adjacent-PCR interval is
+// additionally checked against the expected constant mux rate.
+func AuditWithOptions(data []byte, opts Options) (*Report, *AuditError) {
+	maxPcrGapMs := opts.MaxPcrGapMs
+	rateOn := opts.ExpectedMuxRateBps != 0 || opts.MaxRateErrorPpm != 0
 	if maxPcrGapMs < 1 || maxPcrGapMs > 10000 {
 		return nil, auditError(ErrInvalidMaxPcrGap, "maxPcrGapMs must be between 1 and 10000", -1, -1)
+	}
+	if rateOn && (opts.ExpectedMuxRateBps < MinMuxRateBps || opts.ExpectedMuxRateBps > MaxMuxRateBps ||
+		opts.MaxRateErrorPpm < MinRateErrorPpm || opts.MaxRateErrorPpm > MaxRateErrorPpm) {
+		return nil, auditError(ErrInvalidMuxRateParam,
+			"expectedMuxRateBps must be between 100000 and 200000000 and maxRateErrorPpm between 1 and 100000", -1, -1)
 	}
 	if len(data) == 0 {
 		return nil, auditError(ErrEmptyBody, "request body is empty", -1, -1)
@@ -168,6 +208,10 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 	var prevPCR, unwrappedPCR int64
 	var pcrCount int
 	var payloadTotal int64
+	var rate *muxRateChecker
+	if rateOn {
+		rate = newMuxRateChecker(opts.ExpectedMuxRateBps, opts.MaxRateErrorPpm)
+	}
 
 	for i, p := range pkts {
 		if p.PID == 0x1FFF { // null packets are stuffing and carry no semantics
@@ -188,6 +232,9 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 			if pcrCount == 0 {
 				firstPCR, lastPCR = ref, ref
 				unwrappedPCR = v
+				if rate != nil {
+					rate.markFirst(i)
+				}
 			} else {
 				d := v - prevPCR
 				if d < -pcrCycle/2 { // genuine 33-bit base wraparound
@@ -198,6 +245,11 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 				}
 				if d > int64(maxPcrGapMs)*27000 {
 					return nil, auditError(ErrPCRGapExceeded, "PCR interval exceeds maxPcrGapMs", i, p.PID)
+				}
+				if rate != nil {
+					if aErr := rate.observe(i, p.PID, d); aErr != nil {
+						return nil, aErr
+					}
 				}
 				unwrappedPCR += d
 				ref.Value27MHz = unwrappedPCR
@@ -242,6 +294,10 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 	if pcrCount == 0 {
 		return nil, auditError(ErrNoPCR, "no PCR found on the PMT-declared PCR PID", 0, pmt.pcrPID)
 	}
+	if rateOn && pcrCount < 2 {
+		return nil, auditError(ErrMuxRateIntervalUncomputable,
+			"constant mux rate mode requires at least two PCRs", lastPCR.Packet, pmt.pcrPID)
+	}
 
 	duration := int64(0)
 	if pcrCount > 1 {
@@ -250,6 +306,11 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 	media := make([]MediaPIDStats, 0, len(mediaPIDs))
 	for _, pid := range mediaPIDs {
 		media = append(media, *stats[pid])
+	}
+
+	var muxReport *MuxRateReport
+	if rateOn {
+		muxReport = rate.report()
 	}
 
 	return &Report{
@@ -264,6 +325,7 @@ func Audit(data []byte, maxPcrGapMs int) (*Report, *AuditError) {
 		DurationMs:    float64(duration) / 27000,
 		PayloadBytes:  payloadTotal,
 		Media:         media,
+		MuxRate:       muxReport,
 	}, nil
 }
 

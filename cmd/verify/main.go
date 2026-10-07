@@ -185,8 +185,8 @@ func smokeCases(base string) []check {
 		return b.Bytes()
 	}
 
-	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
-		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?maxPcrGapMs=1000", bytes.NewReader(body))
+	auditQuery := func(body []byte, query, ctype string) (*http.Response, map[string]any, error) {
+		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?"+query, bytes.NewReader(body))
 		req.Header.Set("Content-Type", ctype)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -198,6 +198,23 @@ func smokeCases(base string) []check {
 		_ = json.Unmarshal(raw, &decoded)
 		return resp, decoded, nil
 	}
+
+	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
+		return auditQuery(body, "maxPcrGapMs=1000", ctype)
+	}
+
+	// rateGood places PCR packets adjacently at 1 ms spacing: 188 bytes per
+	// millisecond is a constant mux rate of 1,504,000 bps.
+	rateGood := func(pcrs ...int64) []byte {
+		b := tsbuild.New()
+		b.AddPAT()
+		b.AddPMT()
+		for _, v := range pcrs {
+			b.AddPCR(b.Opt.PCRPID, v)
+		}
+		return b.Bytes()
+	}
+	const rateQueryOK = "maxPcrGapMs=1000&expectedMuxRateBps=1504000&maxRateErrorPpm=1000"
 
 	expectStatus := func(resp *http.Response, want int) error {
 		if resp.StatusCode != want {
@@ -402,6 +419,117 @@ func smokeCases(base string) []check {
 				}
 				defer resp.Body.Close()
 				return expectStatus(resp, http.StatusOK)
+			},
+		},
+		{
+			name: "rate mode: constant mux rate accepted and reported",
+			fn: func() error {
+				resp, body, err := auditQuery(rateGood(0, 27000, 54000, 81000), rateQueryOK, "application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusOK); err != nil {
+					return err
+				}
+				mr, ok := body["report"].(map[string]any)["muxRate"].(map[string]any)
+				if !ok {
+					return fmt.Errorf("muxRate block missing: %v", body)
+				}
+				if mr["expectedMuxRateBps"].(float64) != 1504000 {
+					return fmt.Errorf("expectedMuxRateBps=%v", mr["expectedMuxRateBps"])
+				}
+				if mr["tolerancePpm"].(float64) != 1000 {
+					return fmt.Errorf("tolerancePpm=%v", mr["tolerancePpm"])
+				}
+				if mr["intervalsChecked"].(float64) != 3 {
+					return fmt.Errorf("intervalsChecked=%v", mr["intervalsChecked"])
+				}
+				return nil
+			},
+		},
+		{
+			name: "rate mode: local burst rejected at the latter PCR",
+			fn: func() error {
+				// Average pace looks fine, but the second interval is ~3.8% fast.
+				d := rateGood(0, 27000, 53000, 80000)
+				resp, body, err := auditQuery(d, rateQueryOK, "application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				if err := expectCode(body, "TS_MUX_RATE_MISMATCH", 4); err != nil {
+					return err
+				}
+				if int(body["pid"].(float64)) != 0x0100 {
+					return fmt.Errorf("pid=%v want 256", body["pid"])
+				}
+				return nil
+			},
+		},
+		{
+			name: "rate mode: single PCR is uncomputable",
+			fn: func() error {
+				resp, body, err := auditQuery(rateGood(0), rateQueryOK, "application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(body, "TS_MUX_RATE_INTERVAL_UNCOMPUTABLE", 2)
+			},
+		},
+		{
+			name: "rate mode: parameters must appear together",
+			fn: func() error {
+				resp, body, err := auditQuery(rateGood(0, 27000),
+					"maxPcrGapMs=1000&expectedMuxRateBps=1504000", "application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusBadRequest); err != nil {
+					return err
+				}
+				if body["error"].(map[string]any)["code"] != "TS_MISSING_MUX_RATE_PARAM" {
+					return fmt.Errorf("body=%v", body)
+				}
+				return nil
+			},
+		},
+		{
+			name: "rate mode: out-of-range rate rejected",
+			fn: func() error {
+				resp, body, err := auditQuery(rateGood(0, 27000),
+					"maxPcrGapMs=1000&expectedMuxRateBps=42&maxRateErrorPpm=1000",
+					"application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusBadRequest); err != nil {
+					return err
+				}
+				if body["error"].(map[string]any)["code"] != "TS_INVALID_MUX_RATE_PARAM" {
+					return fmt.Errorf("body=%v", body)
+				}
+				return nil
+			},
+		},
+		{
+			name: "compatibility: legacy request keeps shape without muxRate",
+			fn: func() error {
+				resp, body, err := audit(rateGood(0, 27000, 54000), "application/octet-stream")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusOK); err != nil {
+					return err
+				}
+				if _, ok := body["report"].(map[string]any)["muxRate"]; ok {
+					return fmt.Errorf("muxRate must be omitted for legacy requests")
+				}
+				return nil
 			},
 		},
 	}
