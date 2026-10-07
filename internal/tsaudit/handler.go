@@ -56,6 +56,34 @@ func (AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Constant-mux-rate mode is opt-in; the two parameters are only valid
+	// as a pair.
+	var rateOpt *RateOptions
+	rawRate := r.URL.Query().Get("expectedMuxRateBps")
+	rawPpm := r.URL.Query().Get("maxRateErrorPpm")
+	presentRate := r.URL.Query().Has("expectedMuxRateBps")
+	presentPpm := r.URL.Query().Has("maxRateErrorPpm")
+	if presentRate != presentPpm {
+		writeErr(http.StatusBadRequest, ErrRateParamsMustBePaired,
+			"expectedMuxRateBps and maxRateErrorPpm must be supplied together", nil, nil)
+		return
+	}
+	if presentRate {
+		rateVal, err := strconv.ParseInt(rawRate, 10, 64)
+		if err != nil || rateVal < 100000 || rateVal > 200000000 {
+			writeErr(http.StatusBadRequest, ErrInvalidExpectedMuxRate,
+				"expectedMuxRateBps must be an integer between 100000 and 200000000", nil, nil)
+			return
+		}
+		ppm, err := strconv.Atoi(rawPpm)
+		if err != nil || ppm < 1 || ppm > 100000 {
+			writeErr(http.StatusBadRequest, ErrInvalidMaxRateErrorPpm,
+				"maxRateErrorPpm must be an integer between 1 and 100000", nil, nil)
+			return
+		}
+		rateOpt = &RateOptions{ExpectedMuxRateBps: rateVal, MaxRateErrorPpm: ppm}
+	}
+
 	// One extra byte lets us distinguish exactly 8 MiB from a too-large body.
 	data, err := io.ReadAll(io.LimitReader(r.Body, MaxBodyBytes+1))
 	if err != nil {
@@ -69,7 +97,13 @@ func (AuditHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	report, auditErr := Audit(data, gap)
+	var report *Report
+	var auditErr *AuditError
+	if rateOpt != nil {
+		report, auditErr = AuditWithRate(data, gap, *rateOpt)
+	} else {
+		report, auditErr = Audit(data, gap)
+	}
 	if auditErr != nil {
 		var packet, pid *int
 		if auditErr.Packet >= 0 {

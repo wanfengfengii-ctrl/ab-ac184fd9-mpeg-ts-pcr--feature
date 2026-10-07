@@ -185,8 +185,8 @@ func smokeCases(base string) []check {
 		return b.Bytes()
 	}
 
-	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
-		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?maxPcrGapMs=1000", bytes.NewReader(body))
+	auditQuery := func(body []byte, ctype, query string) (*http.Response, map[string]any, error) {
+		req, _ := http.NewRequest(http.MethodPost, base+"/api/mpegts/audit?"+query, bytes.NewReader(body))
 		req.Header.Set("Content-Type", ctype)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -197,6 +197,26 @@ func smokeCases(base string) []check {
 		var decoded map[string]any
 		_ = json.Unmarshal(raw, &decoded)
 		return resp, decoded, nil
+	}
+
+	audit := func(body []byte, ctype string) (*http.Response, map[string]any, error) {
+		return auditQuery(body, ctype, "maxPcrGapMs=1000")
+	}
+
+	// A constant 10 Mbit/s fragment: 5 packets per PCR interval, 20304
+	// 27 MHz ticks per interval (5*188*8*27e6/20304 == 10 Mbit/s).
+	constRate := func(ticks []int64) []byte {
+		b := tsbuild.New()
+		b.AddPAT()
+		b.AddPMT()
+		for _, t := range ticks {
+			b.AddPCR(b.Opt.PCRPID, t)
+			b.AddPayload(b.Opt.Media[0].PID)
+			b.AddPayload(b.Opt.Media[1].PID)
+			b.AddPayload(b.Opt.Media[0].PID)
+			b.AddPayload(b.Opt.Media[1].PID)
+		}
+		return b.Bytes()
 	}
 
 	expectStatus := func(resp *http.Response, want int) error {
@@ -232,6 +252,92 @@ func smokeCases(base string) []check {
 				}
 				if rep["payloadBytes"].(float64) != 8*184 {
 					return fmt.Errorf("payloadBytes=%v", rep["payloadBytes"])
+				}
+				if _, hasRate := rep["rate"]; hasRate {
+					return fmt.Errorf("rate summary must be absent when rate params are omitted")
+				}
+				return nil
+			},
+		},
+		{
+			name: "constant-rate stream accepted with rate summary",
+			fn: func() error {
+				body := constRate([]int64{0, 20304, 40608, 60912})
+				resp, out, err := auditQuery(body, "application/octet-stream",
+					"maxPcrGapMs=1000&expectedMuxRateBps=10000000&maxRateErrorPpm=100")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusOK); err != nil {
+					return err
+				}
+				rate := out["report"].(map[string]any)["rate"].(map[string]any)
+				if rate["expectedMuxRateBps"].(float64) != 10000000 {
+					return fmt.Errorf("expectedMuxRateBps=%v", rate["expectedMuxRateBps"])
+				}
+				if rate["maxRateErrorPpm"].(float64) != 100 {
+					return fmt.Errorf("maxRateErrorPpm=%v", rate["maxRateErrorPpm"])
+				}
+				if rate["checkedIntervals"].(float64) != 3 {
+					return fmt.Errorf("checkedIntervals=%v", rate["checkedIntervals"])
+				}
+				return nil
+			},
+		},
+		{
+			name: "local burst rejected by rate mode with packet and pid",
+			fn: func() error {
+				// PCR packets land on 2, 7, 12: interval ending at packet 12
+				// carries 42000 ticks instead of 20304 (~6.4 % slow).
+				body := constRate([]int64{0, 20304, 42000})
+				resp, out, err := auditQuery(body, "application/octet-stream",
+					"maxPcrGapMs=1000&expectedMuxRateBps=10000000&maxRateErrorPpm=100")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				if err := expectCode(out, "TS_MUX_RATE_ERROR_EXCEEDED", 12); err != nil {
+					return err
+				}
+				if int(out["pid"].(float64)) != 0x0100 {
+					return fmt.Errorf("pid=%v want 256", out["pid"])
+				}
+				return nil
+			},
+		},
+		{
+			name: "rate mode needs two PCRs",
+			fn: func() error {
+				single := tsbuild.New()
+				single.AddPAT().AddPMT()
+				single.AddPCR(single.Opt.PCRPID, 0)
+				single.AddPayload(single.Opt.Media[0].PID)
+				resp, out, err := auditQuery(single.Bytes(), "application/octet-stream",
+					"maxPcrGapMs=1000&expectedMuxRateBps=10000000&maxRateErrorPpm=100")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusUnprocessableEntity); err != nil {
+					return err
+				}
+				return expectCode(out, "TS_RATE_NEEDS_TWO_PCRS", 2)
+			},
+		},
+		{
+			name: "unpaired rate parameters rejected",
+			fn: func() error {
+				resp, out, err := auditQuery(constRate([]int64{0, 20304}), "application/octet-stream",
+					"maxPcrGapMs=1000&expectedMuxRateBps=10000000")
+				if err != nil {
+					return err
+				}
+				if err := expectStatus(resp, http.StatusBadRequest); err != nil {
+					return err
+				}
+				if out["error"].(map[string]any)["code"] != "TS_RATE_PARAMS_MUST_BE_PAIRED" {
+					return fmt.Errorf("body=%v", out)
 				}
 				return nil
 			},
